@@ -1,0 +1,412 @@
+#!/usr/bin/python3.8
+
+import re, logging
+import importlib
+import subprocess
+from jnpr.junos import Device
+from jnpr.junos.utils.config import Config
+from jnpr.junos.utils.sw import SW
+from jnpr.junos.utils.scp import SCP
+from lxml import etree
+import sys
+import time
+import os
+from argparse import ArgumentParser
+from getpass import getpass
+from jnpr.junos.utils.start_shell import StartShell
+from jnpr.junos.exception import ConfigLoadError, ConnectError
+import jxmlease
+import yaml
+from pathlib import Path
+import warnings
+from lxml import etree as ET
+import os
+import sys
+import datetime
+import pandas as pd
+import multiprocessing
+from functools import partial
+from argparse import ArgumentParser
+import argparse
+from common_library import *
+
+
+def create_multithreading_process(*args):
+        proc=mp.Process(target=eval(args[0]), args=(tuple(args[1:])))
+        proc.daemon=True
+        proc.start()
+
+        return proc
+
+def kill_multithreading_process_list(proc_lst):
+    for proc in proc_lst:
+        proc.kill()
+
+def check_multithreading_process_status(proc_lst):
+
+    flag_all_proc_done=True
+    for proc in proc_lst:
+        proc.join(timeout=0)
+        if proc.is_alive():
+            print(proc, "Job is NOT finished!")
+            flag_all_proc_done = False
+        else:
+            print(proc, "Job is finished!")
+
+    return flag_all_proc_done
+
+def waitfor_multithreading_process_done(proc_lst):
+    while True:
+        ret = check_multithreading_process_status(proc_lst)
+        if ret==True:
+            break
+    return
+
+def check_dict_recursively_for_key_name(dict, key_name):
+    for k, v in dict.items():
+        if k==key_name:
+            return True
+        else:
+            if type(v).__name__=="dict":
+                return check_dict_recursively_for_key_name(v, key_name)
+
+    return False
+
+
+
+def regexp_on_match(regexp, mat2, match_all):
+    assert type(mat2).__name__=="list" or type(mat2).__name__=="str"
+    assert type(regexp).__name__=="list" or type(regexp).__name__=="str"
+
+    mat3 = []
+    if type(mat2).__name__=="list":
+        mat_str=""
+        for v in mat2:
+            mat_str=mat_str+"\n"+v
+        mat2=mat_str
+
+    if type(regexp).__name__=="list":
+        for v in regexp:
+            mat2 = regexp_on_match(v, mat2, match_all)
+            mat3 = mat2
+    else:
+        if match_all==True:
+            mat3 = re.findall(regexp, mat2)
+        else:
+            mat3 = re.search(regexp, mat2)
+    return mat3
+
+
+def execute_command_in_linux_shell(cmd, log_file=None):
+    result = subprocess.run(cmd, shell=True, capture_output=True)
+    print(result)
+
+    cap_str = result.stdout.decode('UTF-8') + result.stderr.decode('UTF-8')
+    if log_file != None:
+        fd = open(log_file, "a")
+        fd.write(cap_str)
+        fd.close()
+
+    return cap_str
+
+def perform_test_checks_on_device_core(dev, title, cmd_dict, capstr=""):
+
+    ret_lst=[]
+    if "cmd" in cmd_dict.keys() or "command" in cmd_dict.keys():
+        mode = cmd_dict.get("mode", "cli")
+        cmd = cmd_dict.get("cmd") or cmd_dict.get("command")
+
+        if mode=="cli":
+            try:
+                capstr = dev.cli(cmd, warning = False).strip()
+            except:
+                return ret_lst.append([title, "**ERROR1**"])
+        elif mode=="linux":
+            capstr = execute_command_in_linux_shell(cmd).strip()
+    flag_dict_val_present = False
+    for key, val in cmd_dict.items():
+        if type(val).__name__=="dict":
+            flag_dict_val_present = True
+            ret= perform_test_checks_on_device_core(dev, key, cmd_dict[key], capstr)
+            ret_lst.extend(ret)
+
+    if flag_dict_val_present == False:
+        match_all = cmd_dict.get("match_all", False)
+        regexp = cmd_dict.get("regexp")
+        record = cmd_dict.get("record")
+        if regexp==None:
+            match = capstr
+        else:
+            match = regexp_on_match(cmd_dict["regexp"], capstr, match_all)
+        if record==None:
+            ret_lst.append([title, match])
+        else:
+            try:
+                print("##TEMP", match)
+                print("##TEMP2", cmd_dict["record"])
+                value = eval(cmd_dict["record"])
+                ret_lst.append([title, value])
+            except:
+                ret_lst.append([title, "**ERROR2**"])
+        return ret_lst
+    else:
+        return ret_lst
+
+
+# Append the dictionary to the CSV file
+def append_dict_to_csv(csv_file, new_row):
+    # Read the existing CSV file into a DataFrame
+    try:
+        df = pd.read_csv(csv_file)
+    except FileNotFoundError:
+        # If the file doesn't exist, create a new DataFrame with the column names
+        df = pd.DataFrame(columns=new_row.keys())
+
+    # Append the new row (dictionary) to the DataFrame
+    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+    # Write the updated DataFrame back to the CSV file
+    df.to_csv(csv_file, index=False)
+    print("Row appended successfully.")
+
+
+def perform_test_checks_on_device(dev, device_health_test_dict, output_csv_file):
+    ret_lst_main = []
+    for k, v in device_health_test_dict.items():
+        if type(v).__name__=="dict":
+            if "rpc_cmd" in v.keys():
+                main_heading(k)
+                try:
+                    match = eval("dev.rpc."+v["rpc_cmd"])
+
+                    if "record" not in v.keys():
+                        ret_lst_main.extend([[k, match]])
+                    else:
+                        ret3=eval(v["record"])
+                        ret_lst_main.extend([[k, ret3]])
+
+                except:
+                    ret_lst_main.extend([[k, "**ERROR3**"]])
+                    #continue
+
+            elif "cmd" in v.keys() or "command" in v.keys():
+                main_heading(k)
+                ret_lst=perform_test_checks_on_device_core(dev, k, v)
+                ret_lst_main.extend(ret_lst)
+                print("\n\n")
+
+    if not os.path.exists(output_csv_file):
+        column_lst=[]
+        for lst in ret_lst_main:
+            column_lst.append(lst[0])
+        print("##SUCH column_lst", column_lst)
+        df = pd.DataFrame(columns=column_lst)
+        df.to_csv(output_csv_file, index=False)
+
+    print("##SUCH ret_lst_main", ret_lst_main)
+    ret_dict={}
+    for lst in ret_lst_main:
+        ret_dict[lst[0]]=lst[1]
+
+    append_dict_to_csv(output_csv_file, ret_dict)
+
+
+def record_device_health(dev_ssh_info, monitor_yaml_file, output_csv_file, monitoring_timeout, loop_sleeptime=30):
+
+
+    dev_ssh = Device(host=dev_ssh_info[0], user=dev_ssh_info[1],
+                     password=dev_ssh_info[2], port=22)
+
+
+    try:
+        dev_ssh.open()
+    except Exception as err:
+        logging.error('Exception: Cannot connect to device: {}\n'.format(err))
+        return -1
+
+
+    # Record the start time
+    start_time = time.time()
+
+    while True:
+        # Calculate the elapsed time
+        elapsed_time = time.time() - start_time
+
+        # Check if the elapsed time exceeds the monitoring timeout
+        if int(elapsed_time) > int(monitoring_timeout):
+            print("Monitoring timeout reached. Exiting loop.")
+            break
+
+
+    ################################################
+    # Monitoring Logic
+    ################################################
+        monitor_dict = yaml.safe_load(Path(monitor_yaml_file).read_text())
+
+        try:
+            perform_test_checks_on_device(dev_ssh, monitor_dict["monitor"], output_csv_file)
+        except:
+            record_device_health(dev_ssh_info, monitor_yaml_file, output_csv_file, monitoring_timeout-elapsed_time, loop_sleeptime)
+            break
+
+        # Wait for 30 seconds before continuing
+        time.sleep(loop_sleeptime)
+
+        print("|**TEST**| Remining Time/Total Time: {}/{}".format(int(elapsed_time), int(monitoring_timeout)))
+
+    print("Loop exited.")
+
+
+def my_background_function(stop_event, func_name, *args, **kwargs):
+    """Runs a function in a separate process and signals when finished."""
+    print(f"Background process started with PID: {os.getpid()}")
+    func_name(*args, **kwargs)  # Run the function once
+    print(f"Background process (PID: {os.getpid()}) finished execution.")
+
+    stop_event.set()  # Signal that the process has finished
+
+
+def start_background_process(func_name, *args, **kwargs):
+    """Starts the background process and returns the process and stop event."""
+    stop_event = multiprocessing.Event()  # Create a stop event
+    process = multiprocessing.Process(target=partial(my_background_function, stop_event, func_name, *args, **kwargs))
+    process.daemon = False  # Allow process to finish properly
+    process.start()
+    return process, stop_event  # Return both process and stop event
+
+
+def stop_background_process(process, stop_event):
+    """Checks if the background process has finished."""
+    if stop_event.is_set():
+        print(f"Process (PID: {process.pid}) has already finished.")
+    elif process and process.is_alive():
+        print(f"Process (PID: {process.pid}) is still running. Waiting to complete...")
+        process.join(timeout=10)  # Wait for the process to finish
+        if process.is_alive():
+            print("Process did not stop gracefully. Terminating...")
+            process.terminate()
+            process.join()
+        print(f"Process (PID: {process.pid}) stopped.")
+    else:
+        print("No background process to stop (it may have already finished).")
+
+
+if __name__ == '__main__':
+    global tool_name
+    global dir_name
+    tool_name="ccl_device_monitor"
+    dir_name =tool_name
+
+    main_heading_list(
+        "CCL-DEVICE-MONITOR",
+        "Monitor The Device And Plot The Graph",
+        "Suchandra (svinukonda@juniper.net)",
+        "2025-02-19"
+    )
+
+    dir_name =tool_name
+    pexpect.run("mkdir -p "+sysfiles_folder)
+
+    parser = argparse.ArgumentParser(description="""
+    Monitor The Device And Plot The Graph
+    usage examples:
+    ccl-devices-monitor 
+    ccl-devices-monitor   input.yaml
+    """)
+    parser.add_argument('file', type=str, nargs='?', help="Input Yaml File For Device Monitor")
+    args = parser.parse_args()
+
+    if args.file==None:
+        user_input_file = "user_input_ccl_device_monitor.yaml"
+        user_input_file_with_path=sysfiles_folder + user_input_file
+        ret = check_file_exists(user_input_file_with_path)
+
+        if ret == False:
+            os.system("cp {ccl_labs_folder}/{tool_name}/{user_input_file} {sysfiles_folder}/.".
+                      format(tool_name=tool_name, user_input_file=user_input_file, sysfiles_folder=sysfiles_folder,
+                             ccl_labs_folder=ccl_labs_folder))
+
+            os.system("vi {}".format(user_input_file_with_path))
+
+        else:
+            ch = USER_INPUT_TEMPLATE1(" INPUT FILE {} already Existed.".format(sysfiles_folder + user_input_file),
+                             {'y': 'Open existing Input File --(default)', 'r': 'reload default and open', 'c': 'continue without open'}, tool_name)
+            if ch == 'r':
+                cmd = "cp {}/{} {}".format(ccl_labs_folder+dir_name, user_input_file, sysfiles_folder)
+                print(cmd)
+                os.system(cmd)
+
+                os.system("vi {}".format(user_input_file_with_path))
+            elif ch == 'c':
+                pass
+            elif ch == "y":
+                os.system("vi {}".format(user_input_file_with_path))
+
+    else:
+        user_input_file = args.file
+        user_input_file_with_path = user_input_file
+        ret = check_file_exists(user_input_file)
+
+
+
+    monitor_yaml_file = user_input_file_with_path
+
+    monitor_dict = yaml.safe_load(Path(monitor_yaml_file).read_text())
+
+    dev_info_lst = monitor_dict["framework_variables"]["dev_info_list"]
+    monitoring_time = monitor_dict["framework_variables"]["monitoring_time"]
+    loop_sleeptime = monitor_dict["framework_variables"]["loop_sleeptime"]
+    output_file_substr = monitor_dict["framework_variables"]["output_file_substr"]
+
+    output_dir = "ccl_device_monitor_output/ccl_device_monitor__" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    os.system("mkdir -p {}".format(output_dir))
+
+    bg_process_info_lst=[]
+    for dev_info in dev_info_lst:
+        dev_info = [x.strip() for x in dev_info.split(",")]
+
+
+        bg_process, bg_stop_event = start_background_process(record_device_health, dev_info, monitor_yaml_file,
+                                 output_dir+"/ccl_device_monitor_output_"+dev_info[0]+".csv", monitoring_time, loop_sleeptime)
+
+        bg_process_info_lst.append([bg_process, bg_stop_event])
+
+
+    #Verify processes completion
+    start_time = time.time()
+
+    while True:
+        flag_to_stay=False
+        elapsed_time = time.time() - start_time
+
+        for process_info in bg_process_info_lst:
+            print("process_info[1].is_set()", process_info[0].is_alive())
+            if not process_info[1].is_set():
+                flag_to_stay=True
+
+        if flag_to_stay==False:
+            heading("All processes are Done")
+            break
+        else:
+            if int(elapsed_time) <= int(monitoring_time):
+                heading("Processes are Running")
+                heading("|** ccl-device-monitor **| Remining Time (in Total Time): {}/{}".format(int(elapsed_time), int(monitoring_time)))
+                time.sleep(60)
+            else:
+                heading("Processes are Running. But monitoring_time is completed. Hence exiting.")
+                break
+
+    for dev_info in dev_info_lst:
+        dev_info = [x.strip() for x in dev_info.split(",")]
+        os.system("/homes/svinukonda/ccl_labs/ccl-convert-csv-to-html {}/{}".format(output_dir, "ccl_device_monitor_output_"+dev_info[0]+".csv"))
+    os.system("chmod -R 755 {}".format(output_dir))
+    create_public_link(output_dir, "ccl_device_monitor_output", output_dir.rsplit("/")[-1])
+
+
+
+
+
+
+
+

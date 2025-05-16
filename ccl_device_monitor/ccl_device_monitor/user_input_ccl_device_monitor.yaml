@@ -1,0 +1,80 @@
+framework_variables:
+  dev_info_list:
+    - 10.85.88.34, root, Embe1mpls
+  output_file_substr: ccl_device_monitoring
+  monitoring_time: 1800
+  loop_sleeptime: 30
+
+monitor:
+  #NOTE: commands with pipe will not work here
+
+  time:
+    command: date
+    mode: linux
+
+  system_alarm_count:
+    command: show system alarms
+    regexp: .+(?:\s+Major\s+|\s+Minor\s+).+
+    record: len(match)
+    match_all: True
+
+  ae1_traffic_rate:
+    command: show interfaces ae1
+    ae1_input_rate:
+      regexp: Input rate\s+:\s+(\d+) bps
+      record: match.group(1)
+    ae1_output_rate:
+      regexp: Output rate\s+:\s+(\d+) bps
+      record: match.group(1)
+
+  nat_sessions:
+    rpc_cmd: retrieve_source_nat_pool_information(all=True).findtext(".//total-pool-address").strip()
+
+  re_cpu:
+    rpc_cmd: get_route_engine_information().findtext(".//cpu-idle").strip()
+    record: int(100-int(match))
+
+  security_monitoring:
+    cmd: show snmp mib walk .1.3.6.1.4.1.2636.3.39.1.12.1.1.1.4
+    min_spu_cpu:
+      regexp: \= (\d+)
+      record: min(match)
+      match_all: True
+    max_spu_cpu:
+      regexp: \= (\d+)
+      record: max(match)
+      match_all: True
+
+  device_cps:
+    cmd: show snmp mib walk 1.3.6.1.4.1.2636.3.39.1.12.1.4.1.5
+    regexp: \= (\d+)
+    record: match.group(1)
+
+  total_sessions:
+    cmd: show security monitoring
+    regexp: Total Sessions:\s+(\d+)
+    record: match.group(1)
+
+  online_pic_count:
+    cmd: show chassis fpc pic-status
+    regexp: Online
+    record: len(match)
+    match_all: True
+
+  bgp_up_peers:
+    cmd: show bgp summary
+    regexp: Establ
+    record: len(match)
+    match_all: True
+
+  bfd_up_peers:
+    cmd: show bgp summary
+    regexp: Up
+    record: len(match)
+    match_all: True
+
+
+  #ae1_traffic_rate:
+  #  command: 'show interfaces ae1'
+  #  regexp: Input rate\s+:\s+(\d+) bps
+  #  record: match[0]
